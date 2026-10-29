@@ -22,9 +22,127 @@ param(
     [string]$BravePath
 )
 
+$leftUrls = @(
+    'https://mail.google.com/mail/u/0/#inbox'
+    'https://docs.google.com/spreadsheets/d/1RlJTrdOS0S42WohewQlYB8dMo1PjNo8VfuVwAa53IdU/edit?gid=1149591132#gid=1149591132'
+    'https://chatgpt.com/'
+    'https://www.codewars.com/kata/search/go?q=&r%5B%5D=-5&xids=completed&beta=false&order_by=popularity%20desc'
+)
+
+$rightUrls = @(
+    'https://timers.richarddotparker.workers.dev/'
+)
+
 $ErrorActionPreference = 'Stop'
 
-$nativeSource = @'
+function Open-WorkspaceWindow {
+    param([string[]]$Urls, [int]$X, [int]$Y, [int]$Width, [int]$Height)
+
+    $before = @($native::BraveWindows())
+    # URLs are quoted individually so ampersands and other URL characters survive.
+    $arguments = '--new-window ' + (($Urls | ForEach-Object { '"' + $_ + '"' }) -join ' ')
+    Start-Process -FilePath $BravePath -ArgumentList $arguments | Out-Null
+    $deadline = [DateTime]::UtcNow.AddSeconds(30)
+    do {
+        Start-Sleep -Milliseconds 200
+        $created = @($native::BraveWindows() | Where-Object { $_ -notin $before })
+    } until ($created.Count -gt 0 -or [DateTime]::UtcNow -ge $deadline)
+
+    if ($created.Count -ne 1) {
+        throw "Expected one new Brave window; found $($created.Count). Close any first-run prompts and retry; avoid opening other Brave windows while this script runs."
+    }
+
+    $handle = $created[0]
+    # Restore first in case Brave inherits a maximized state. Repeat placement
+    # after startup so Chromium's saved window placement has time to settle.
+    foreach ($attempt in 1..3) {
+        [void]$native::ShowWindow($handle, 9)
+        # Move to the target display first so border measurements use its DPI.
+        if ($attempt -eq 1) {
+            [void]$native::SetWindowPos($handle, [IntPtr]::Zero, $X, $Y, $Width, $Height, 0x0014)
+            Start-Sleep -Milliseconds 300
+        }
+
+        if (-not $native::PlaceVisibleWindow($handle, $X, $Y, $Width, $Height)) {
+            throw "Could not position Brave: $([Runtime.InteropServices.Marshal]::GetLastWin32Error())"
+        }
+
+        Start-Sleep -Milliseconds 300
+    }
+}
+
+function Open-BraveWorkspace {
+    $native = Get-WorkspaceNativeType
+
+    $previousDpiContext = $native::SetThreadDpiAwarenessContext([IntPtr](-4))
+    try {
+        $displays = @($native::Displays())
+        if ($ListMonitors) {
+            $displays | Select-Object @{Name = 'MonitorNumber'; Expression = { [int]($_.Device -replace '^.*DISPLAY', '') } },
+            Device, Left, Top, Width, Height, Dpi | Format-Table -AutoSize
+            return
+        }
+
+        $display = $displays | Where-Object { $_.Device -match ('DISPLAY' + $MonitorNumber + '$') }
+        if (-not $display) {
+            throw "Monitor $MonitorNumber was not found. Run with -ListMonitors to see available monitors."
+        }
+
+        if (-not $BravePath) {
+            $candidates = @(
+                "${env:ProgramFiles}\BraveSoftware\Brave-Browser\Application\brave.exe"
+                "${env:ProgramFiles(x86)}\BraveSoftware\Brave-Browser\Application\brave.exe"
+                "$env:LOCALAPPDATA\BraveSoftware\Brave-Browser\Application\brave.exe"
+            )
+
+            $BravePath = $candidates | Where-Object { Test-Path -LiteralPath $_ -PathType Leaf } | Select-Object -First 1
+            if (-not $BravePath) {
+                throw 'Brave was not found. Supply -BravePath with the full path to brave.exe.'
+            }
+        }
+
+        $rightWidth = [int][Math]::Round(515 * $display.Dpi / 96.0)
+        $rightHeight = [int][Math]::Round(658 * $display.Dpi / 96.0)
+        $leftWidth = $display.Width - $rightWidth
+        if ($leftWidth -lt 500 * $display.Dpi / 96.0 -or $rightHeight -gt $display.Height) {
+            throw 'The selected monitor is too small for this layout at its current scaling.'
+        }
+
+        # A cold launch normally applies Brave's startup/session-restore settings.
+        # Initialize the browser without a startup window before requesting our
+        # explicit windows, so tabs from the previous session aren't restored here.
+        if (-not (Get-Process -Name brave -ErrorAction SilentlyContinue)) {
+            Start-Process -FilePath $BravePath -ArgumentList '--no-startup-window' | Out-Null
+            $startupDeadline = [DateTime]::UtcNow.AddSeconds(30)
+            do {
+                Start-Sleep -Milliseconds 200
+                $browserProcesses = @(Get-Process -Name brave -ErrorAction SilentlyContinue)
+            } until ($browserProcesses.Count -gt 0 -or [DateTime]::UtcNow -ge $startupDeadline)
+
+            if ($browserProcesses.Count -eq 0) {
+                throw 'Brave did not start within 30 seconds.'
+            }
+
+            # Allow profile initialization to finish before the next launch request.
+            Start-Sleep -Seconds 2
+        }
+
+        Open-WorkspaceWindow -Urls $leftUrls -X $display.Left -Y $display.Top -Width $leftWidth -Height $display.Height
+
+        Open-WorkspaceWindow -Urls $rightUrls `
+            -X ($display.Left + $leftWidth) -Y $display.Top -Width $rightWidth -Height $rightHeight
+
+        Write-Host "Opened Brave workspace on monitor $MonitorNumber."
+    }
+    finally {
+        if ($previousDpiContext -ne [IntPtr]::Zero) {
+            [void]$native::SetThreadDpiAwarenessContext($previousDpiContext)
+        }
+    }
+}
+
+function Get-WorkspaceNativeType {
+    $nativeSource = @'
 using System;
 using System.Collections.Generic;
 using System.Runtime.InteropServices;
@@ -106,125 +224,24 @@ namespace BraveWorkspace {
     }
 }
 '@
-# A content-based namespace lets updated helper code coexist with versions
-# already loaded in this PowerShell session (Add-Type cannot replace a type).
-$hasher = [System.Security.Cryptography.SHA256]::Create()
-try {
-    $sourceHash = [BitConverter]::ToString($hasher.ComputeHash([Text.Encoding]::UTF8.GetBytes($nativeSource))).Replace('-', '')
-}
-finally {
-    $hasher.Dispose()
-}
+    # A content-based namespace lets updated helper code coexist with versions
+    # already loaded in this PowerShell session (Add-Type cannot replace a type).
+    $hasher = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        $sourceHash = [BitConverter]::ToString($hasher.ComputeHash([Text.Encoding]::UTF8.GetBytes($nativeSource))).Replace('-', '')
+    }
+    finally {
+        $hasher.Dispose()
+    }
 
-$nativeNamespace = 'BraveWorkspace_' + $sourceHash
-$native = ($nativeNamespace + '.Native') -as [type]
-if (-not $native) {
-    Add-Type -TypeDefinition $nativeSource.Replace('namespace BraveWorkspace {', "namespace $nativeNamespace {")
+    $nativeNamespace = 'BraveWorkspace_' + $sourceHash
     $native = ($nativeNamespace + '.Native') -as [type]
+    if (-not $native) {
+        Add-Type -TypeDefinition $nativeSource.Replace('namespace BraveWorkspace {', "namespace $nativeNamespace {")
+        $native = ($nativeNamespace + '.Native') -as [type]
+    }
+
+    return $native
 }
 
-function Open-WorkspaceWindow {
-    param([string[]]$Urls, [int]$X, [int]$Y, [int]$Width, [int]$Height)
-
-    $before = @($native::BraveWindows())
-    # URLs are quoted individually so ampersands and other URL characters survive.
-    $arguments = '--new-window ' + (($Urls | ForEach-Object { '"' + $_ + '"' }) -join ' ')
-    Start-Process -FilePath $BravePath -ArgumentList $arguments | Out-Null
-    $deadline = [DateTime]::UtcNow.AddSeconds(30)
-    do {
-        Start-Sleep -Milliseconds 200
-        $created = @($native::BraveWindows() | Where-Object { $_ -notin $before })
-    } until ($created.Count -gt 0 -or [DateTime]::UtcNow -ge $deadline)
-
-    if ($created.Count -ne 1) {
-        throw "Expected one new Brave window; found $($created.Count). Close any first-run prompts and retry; avoid opening other Brave windows while this script runs."
-    }
-
-    $handle = $created[0]
-    # Restore first in case Brave inherits a maximized state. Repeat placement
-    # after startup so Chromium's saved window placement has time to settle.
-    foreach ($attempt in 1..3) {
-        [void]$native::ShowWindow($handle, 9)
-        # Move to the target display first so border measurements use its DPI.
-        if ($attempt -eq 1) {
-            [void]$native::SetWindowPos($handle, [IntPtr]::Zero, $X, $Y, $Width, $Height, 0x0014)
-            Start-Sleep -Milliseconds 300
-        }
-
-        if (-not $native::PlaceVisibleWindow($handle, $X, $Y, $Width, $Height)) {
-            throw "Could not position Brave: $([Runtime.InteropServices.Marshal]::GetLastWin32Error())"
-        }
-
-        Start-Sleep -Milliseconds 300
-    }
-}
-
-$previousDpiContext = $native::SetThreadDpiAwarenessContext([IntPtr](-4))
-try {
-    $displays = @($native::Displays())
-    if ($ListMonitors) {
-        $displays | Select-Object @{Name = 'MonitorNumber'; Expression = { [int]($_.Device -replace '^.*DISPLAY', '') } },
-        Device, Left, Top, Width, Height, Dpi | Format-Table -AutoSize
-        return
-    }
-
-    $display = $displays | Where-Object { $_.Device -match ('DISPLAY' + $MonitorNumber + '$') }
-    if (-not $display) {
-        throw "Monitor $MonitorNumber was not found. Run with -ListMonitors to see available monitors."
-    }
-
-    if (-not $BravePath) {
-        $candidates = @(
-            "${env:ProgramFiles}\BraveSoftware\Brave-Browser\Application\brave.exe"
-            "${env:ProgramFiles(x86)}\BraveSoftware\Brave-Browser\Application\brave.exe"
-            "$env:LOCALAPPDATA\BraveSoftware\Brave-Browser\Application\brave.exe"
-        )
-
-        $BravePath = $candidates | Where-Object { Test-Path -LiteralPath $_ -PathType Leaf } | Select-Object -First 1
-        if (-not $BravePath) {
-            throw 'Brave was not found. Supply -BravePath with the full path to brave.exe.'
-        }
-    }
-
-    $rightWidth = [int][Math]::Round(515 * $display.Dpi / 96.0)
-    $rightHeight = [int][Math]::Round(658 * $display.Dpi / 96.0)
-    $leftWidth = $display.Width - $rightWidth
-    if ($leftWidth -lt 500 * $display.Dpi / 96.0 -or $rightHeight -gt $display.Height) {
-        throw 'The selected monitor is too small for this layout at its current scaling.'
-    }
-
-    # A cold launch normally applies Brave's startup/session-restore settings.
-    # Initialize the browser without a startup window before requesting our
-    # explicit windows, so tabs from the previous session aren't restored here.
-    if (-not (Get-Process -Name brave -ErrorAction SilentlyContinue)) {
-        Start-Process -FilePath $BravePath -ArgumentList '--no-startup-window' | Out-Null
-        $startupDeadline = [DateTime]::UtcNow.AddSeconds(30)
-        do {
-            Start-Sleep -Milliseconds 200
-            $browserProcesses = @(Get-Process -Name brave -ErrorAction SilentlyContinue)
-        } until ($browserProcesses.Count -gt 0 -or [DateTime]::UtcNow -ge $startupDeadline)
-
-        if ($browserProcesses.Count -eq 0) {
-            throw 'Brave did not start within 30 seconds.'
-        }
-
-        # Allow profile initialization to finish before the next launch request.
-        Start-Sleep -Seconds 2
-    }
-
-    Open-WorkspaceWindow -Urls @(
-        'https://mail.google.com/mail/u/0/#inbox'
-        'https://docs.google.com/spreadsheets/d/1RlJTrdOS0S42WohewQlYB8dMo1PjNo8VfuVwAa53IdU/edit?gid=1149591132#gid=1149591132'
-        'https://www.codewars.com/kata/search/go?q=&r%5B%5D=-5&xids=completed&beta=false&order_by=popularity%20desc'
-    ) -X $display.Left -Y $display.Top -Width $leftWidth -Height $display.Height
-
-    Open-WorkspaceWindow -Urls @('https://timers.richarddotparker.workers.dev/') `
-        -X ($display.Left + $leftWidth) -Y $display.Top -Width $rightWidth -Height $rightHeight
-
-    Write-Host "Opened Brave workspace on monitor $MonitorNumber."
-}
-finally {
-    if ($previousDpiContext -ne [IntPtr]::Zero) {
-        [void]$native::SetThreadDpiAwarenessContext($previousDpiContext)
-    }
-}
+Open-BraveWorkspace
